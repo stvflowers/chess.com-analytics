@@ -132,6 +132,7 @@ dmypy.json
 # ===================================
 
 # Database configuration files with credentials
+database_config.json
 config.json
 database_config.json
 connection_strings.txt

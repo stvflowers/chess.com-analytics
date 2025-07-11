@@ -2,3 +2,4 @@ chess.com
 requests
 python-dateutil
 pyodbc
+azure-identity

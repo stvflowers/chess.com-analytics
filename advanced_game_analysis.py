@@ -8,16 +8,71 @@ This script provides detailed analysis of recent Chess.com games including:
 - Game accuracy when available
 - Time control distribution
 - Rating progression
-- SQL Database storage for historical analysis
+- SQL Database storage for historical analysis using Azure AD authentication
+- Support for single user or batch processing of multiple users
+- Date and time filtering for specific periods
+
+Usage:
+    python advanced_game_analysis.py [username(s)] [options]
+    
+Examples:
+    # Basic analysis for single user
+    python advanced_game_analysis.py hikaru --num-games 50
+    
+    # Batch analysis for multiple users
+    python advanced_game_analysis.py hikaru magnuscarlsen gothamchess --num-games 30
+    
+    # Analysis with database storage (uses database_config.json)
+    python advanced_game_analysis.py your_username --use-database --num-games 100
+    
+    # Batch analysis with database and custom delay
+    python advanced_game_analysis.py user1 user2 user3 --use-database --delay 5.0
+    
+    # Filter games by date range
+    python advanced_game_analysis.py hikaru --start-date 2024-01-01 --end-date 2024-12-31
+    
+    # Filter games by specific dates and times
+    python advanced_game_analysis.py hikaru --start-date 2024-06-01 --start-time 14:00 --end-date 2024-06-30 --end-time 18:00
+    
+    # Analyze games from a specific date onwards
+    python advanced_game_analysis.py hikaru --start-date 2024-06-15 --num-games 100
+    
+    # Analyze games up to a specific date
+    python advanced_game_analysis.py hikaru --end-date 2024-06-30 --num-games 50
+    
+Date/Time Filtering:
+    --start-date: Filter games from this date onwards (YYYY-MM-DD format)
+    --end-date: Filter games up to this date (YYYY-MM-DD format)
+    --start-time: Specific start time (HH:MM format, used with start-date)
+    --end-time: Specific end time (HH:MM format, used with end-date)
+    
+    Note: If no time is specified with a date, start-date defaults to 00:00 
+    and end-date defaults to 23:59:59 (end of day).
+    
+Database Configuration:
+    When using --use-database for the first time, a template 'database_config.json' 
+    file will be created. Edit this file with your Azure SQL and App Registration details:
+    
+    {
+        "server": "your-server.database.windows.net",
+        "database": "your-database",
+        "tenant_id": "your-azure-ad-tenant-id",
+        "client_id": "your-app-registration-client-id", 
+        "client_secret": "your-app-registration-client-secret",
+        "driver": "{ODBC Driver 17 for SQL Server}"
+    }
+    
+    Note: Add database_config.json to .gitignore to keep credentials secure.
 """
 
 import json
+import argparse
 from datetime import datetime, timedelta
 from chessdotcom import get_player_profile, get_player_games_by_month
 from chessdotcom.client import Client
 import re
 
-# Try to import pyodbc, gracefully handle if not available
+# Try to import required packages, gracefully handle if not available
 try:
     import pyodbc
     PYODBC_AVAILABLE = True
@@ -26,17 +81,99 @@ except ImportError:
     print("⚠️  pyodbc not available. Install with: pip install pyodbc")
     print("   Database features will be disabled.")
 
+try:
+    from azure.identity import ClientSecretCredential
+    import struct
+    AZURE_AUTH_AVAILABLE = True
+except ImportError:
+    AZURE_AUTH_AVAILABLE = False
+    if PYODBC_AVAILABLE:
+        print("⚠️  azure-identity not available. Install with: pip install azure-identity")
+        print("   Azure AD authentication will not be available.")
+
 # IMPORTANT: Set a proper User-Agent header (required by Chess.com API)
 Client.request_config['headers']['User-Agent'] = 'Chess.com Advanced Game Analysis. Contact: your-email@example.com'
 
-# Database configuration
-DATABASE_CONFIG = {
+# Database configuration file path
+DATABASE_CONFIG_FILE = 'database_config.json'
+
+# Default database configuration template
+DEFAULT_DATABASE_CONFIG = {
     'server': 'your-server.database.windows.net',
     'database': 'your-database',
-    'username': 'your-username', 
-    'password': 'your-password',
+    'tenant_id': 'your-tenant-id',
+    'client_id': 'your-client-id',
+    'client_secret': 'your-client-secret',
     'driver': '{ODBC Driver 17 for SQL Server}'
 }
+
+
+def load_database_config():
+    """
+    Load database configuration from file or create template if it doesn't exist.
+    
+    Returns:
+        dict: Database configuration
+    """
+    try:
+        with open(DATABASE_CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        print(f"⚠️  Database config file '{DATABASE_CONFIG_FILE}' not found.")
+        print("   Creating template file...")
+        create_database_config_template()
+        return DEFAULT_DATABASE_CONFIG.copy()
+    except json.JSONDecodeError:
+        print(f"❌ Error parsing '{DATABASE_CONFIG_FILE}'. Using default config.")
+        return DEFAULT_DATABASE_CONFIG.copy()
+
+
+def create_database_config_template():
+    """Create a template database configuration file."""
+    try:
+        with open(DATABASE_CONFIG_FILE, 'w') as f:
+            json.dump(DEFAULT_DATABASE_CONFIG, f, indent=4)
+        print(f"✅ Created template config file: {DATABASE_CONFIG_FILE}")
+        print("   Please edit this file with your Azure SQL and App Registration details:")
+        print("   - server: Your Azure SQL server name")
+        print("   - database: Your database name")
+        print("   - tenant_id: Your Azure AD tenant ID")
+        print("   - client_id: Your App Registration client ID")
+        print("   - client_secret: Your App Registration client secret")
+    except Exception as e:
+        print(f"❌ Error creating config file: {e}")
+
+
+def get_access_token(tenant_id, client_id, client_secret):
+    """
+    Get access token for Azure SQL using App Registration credentials.
+    
+    Args:
+        tenant_id (str): Azure AD tenant ID
+        client_id (str): App Registration client ID
+        client_secret (str): App Registration client secret
+        
+    Returns:
+        str: Access token or None if failed
+    """
+    if not AZURE_AUTH_AVAILABLE:
+        print("❌ Azure authentication not available. Install azure-identity package.")
+        return None
+        
+    try:
+        credential = ClientSecretCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        
+        # Get token for Azure SQL Database
+        token = credential.get_token("https://database.windows.net/")
+        return token.token
+    except Exception as e:
+        print(f"❌ Error getting access token: {e}")
+        return None
 
 
 def configure_database(server=None, database=None, username=None, password=None):
@@ -46,48 +183,67 @@ def configure_database(server=None, database=None, username=None, password=None)
     Args:
         server (str): Azure SQL server name (e.g., 'your-server.database.windows.net')
         database (str): Database name
-        username (str): Database username
-        password (str): Database password
+        username (str): Database username (deprecated - use App Registration)
+        password (str): Database password (deprecated - use App Registration)
     """
-    global DATABASE_CONFIG
-    
-    if server:
-        DATABASE_CONFIG['server'] = server
-    if database:
-        DATABASE_CONFIG['database'] = database
-    if username:
-        DATABASE_CONFIG['username'] = username
-    if password:
-        DATABASE_CONFIG['password'] = password
-    
-    print("✅ Database configuration updated")
-    print(f"   Server: {DATABASE_CONFIG['server']}")
-    print(f"   Database: {DATABASE_CONFIG['database']}")
-    print(f"   Username: {DATABASE_CONFIG['username']}")
+    print("⚠️  Note: configure_database() is deprecated.")
+    print("   Please use database_config.json file for Azure AD authentication.")
+    print("   Run with --use-database to create template config file.")
 
 
 def get_database_connection():
     """
-    Create and return a database connection.
+    Create and return a database connection using Azure AD authentication.
     
     Returns:
         pyodbc.Connection: Database connection object or None if failed
     """
     if not PYODBC_AVAILABLE:
         return None
+    
+    # Load database configuration
+    config = load_database_config()
+    
+    # Check if config has required fields
+    required_fields = ['server', 'database', 'tenant_id', 'client_id', 'client_secret']
+    missing_fields = [field for field in required_fields if not config.get(field) or config[field].startswith('your-')]
+    
+    if missing_fields:
+        print(f"❌ Missing or incomplete database configuration fields: {', '.join(missing_fields)}")
+        print(f"   Please edit {DATABASE_CONFIG_FILE} with your actual values.")
+        return None
         
     try:
-        connection_string = (
-            f"DRIVER={DATABASE_CONFIG['driver']};"
-            f"SERVER={DATABASE_CONFIG['server']};"
-            f"DATABASE={DATABASE_CONFIG['database']};"
-            f"UID={DATABASE_CONFIG['username']};"
-            f"PWD={DATABASE_CONFIG['password']}"
+        # Get access token for Azure AD authentication
+        access_token = get_access_token(
+            config['tenant_id'], 
+            config['client_id'], 
+            config['client_secret']
         )
-        connection = pyodbc.connect(connection_string)
+        
+        if not access_token:
+            print("❌ Failed to get access token for Azure SQL")
+            return None
+        
+        # Convert token to bytes for pyodbc
+        token_bytes = access_token.encode('utf-16-le')
+        token_struct = struct.pack(f'<I{len(token_bytes)}s', len(token_bytes), token_bytes)
+        
+        # Create connection string with access token
+        connection_string = (
+            f"DRIVER={config['driver']};"
+            f"SERVER={config['server']};"
+            f"DATABASE={config['database']};"
+        )
+        
+        # Connect using access token
+        connection = pyodbc.connect(connection_string, attrs_before={1256: token_struct})
+        print("✅ Connected to Azure SQL Database using Azure AD authentication")
         return connection
+        
     except Exception as e:
         print(f"❌ Error connecting to database: {e}")
+        print("   Please verify your Azure AD credentials and database configuration.")
         return None
 
 
@@ -226,13 +382,16 @@ def get_user_statistics_from_database(connection, username):
         return None
 
 
-def get_recent_games(username, num_games=50):
+def get_recent_games(username, num_games=50, start_date=None, end_date=None):
     """
     Fetch recent games for a user, searching back through multiple months if needed.
+    Can optionally filter by date range.
     
     Args:
         username (str): Chess.com username
         num_games (int): Number of recent games to fetch
+        start_date (datetime): Optional start date filter (inclusive)
+        end_date (datetime): Optional end date filter (inclusive)
         
     Returns:
         list: List of game dictionaries
@@ -240,29 +399,79 @@ def get_recent_games(username, num_games=50):
     games = []
     current_date = datetime.now()
     
-    # Search through the last 12 months to get enough games
-    for month_offset in range(12):
-        target_date = current_date - timedelta(days=30 * month_offset)
-        year = target_date.year
-        month = target_date.month
+    # If date filters are provided, adjust search strategy
+    if start_date or end_date:
+        # Calculate the range of months to search
+        search_start = start_date if start_date else datetime(current_date.year - 1, current_date.month, 1)
+        search_end = end_date if end_date else current_date
         
-        try:
-            monthly_games = get_player_games_by_month(username, year, month)
-            monthly_data = monthly_games.json.get('games', [])
-            
-            if monthly_data:
-                games.extend(monthly_data)
-                print(f"  Found {len(monthly_data)} games in {year}-{month:02d}")
-            
-            # Stop if we have enough games
-            if len(games) >= num_games:
-                break
+        # Generate list of year-month pairs to search
+        months_to_search = []
+        current_search = search_start.replace(day=1)
+        while current_search <= search_end:
+            months_to_search.append((current_search.year, current_search.month))
+            if current_search.month == 12:
+                current_search = current_search.replace(year=current_search.year + 1, month=1)
+            else:
+                current_search = current_search.replace(month=current_search.month + 1)
+        
+        print(f"  Searching {len(months_to_search)} months for date-filtered games...")
+        
+        for year, month in months_to_search:
+            try:
+                monthly_games = get_player_games_by_month(username, year, month)
+                monthly_data = monthly_games.json.get('games', [])
                 
-        except Exception as e:
-            continue
+                if monthly_data:
+                    # Filter games by date range if specified
+                    filtered_games = []
+                    for game in monthly_data:
+                        game_timestamp = game.get('end_time', 0)
+                        game_date = datetime.fromtimestamp(game_timestamp)
+                        
+                        # Check if game falls within date range
+                        if start_date and game_date < start_date:
+                            continue
+                        if end_date and game_date > end_date:
+                            continue
+                        
+                        filtered_games.append(game)
+                    
+                    if filtered_games:
+                        games.extend(filtered_games)
+                        print(f"  Found {len(filtered_games)} games in {year}-{month:02d} (filtered from {len(monthly_data)})")
+                
+            except Exception as e:
+                continue
+    else:
+        # Original logic for recent games without date filtering
+        for month_offset in range(12):
+            target_date = current_date - timedelta(days=30 * month_offset)
+            year = target_date.year
+            month = target_date.month
+            
+            try:
+                monthly_games = get_player_games_by_month(username, year, month)
+                monthly_data = monthly_games.json.get('games', [])
+                
+                if monthly_data:
+                    games.extend(monthly_data)
+                    print(f"  Found {len(monthly_data)} games in {year}-{month:02d}")
+                
+                # Stop if we have enough games
+                if len(games) >= num_games:
+                    break
+                    
+            except Exception as e:
+                continue
     
-    # Return the most recent games
-    return games[-num_games:] if len(games) >= num_games else games
+    # Sort games by end_time (most recent first) and apply num_games limit
+    games.sort(key=lambda x: x.get('end_time', 0), reverse=True)
+    
+    if len(games) > num_games:
+        return games[:num_games]
+    else:
+        return games
 
 
 def extract_opening_moves(pgn):
@@ -465,7 +674,7 @@ def analyze_game(game, username):
     }
 
 
-def analyze_user_games(username, num_games=50, save_to_database=False):
+def analyze_user_games(username, num_games=50, save_to_database=False, start_date=None, end_date=None):
     """
     Analyze recent games for a user with comprehensive statistics and optional database storage.
     
@@ -473,9 +682,22 @@ def analyze_user_games(username, num_games=50, save_to_database=False):
         username (str): Chess.com username
         num_games (int): Number of recent games to analyze
         save_to_database (bool): Whether to save results to database
+        start_date (datetime): Optional start date filter (inclusive)
+        end_date (datetime): Optional end date filter (inclusive)
     """
     print(f"\n📊 Advanced Chess.com Game Analysis for: {username}")
-    print(f"🔍 Analyzing last {num_games} games...")
+    
+    # Format date range info
+    date_info = ""
+    if start_date or end_date:
+        if start_date and end_date:
+            date_info = f" from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+        elif start_date:
+            date_info = f" from {start_date.strftime('%Y-%m-%d')} onwards"
+        elif end_date:
+            date_info = f" up to {end_date.strftime('%Y-%m-%d')}"
+    
+    print(f"🔍 Analyzing up to {num_games} games{date_info}...")
     
     # Database connection
     db_connection = None
@@ -498,9 +720,9 @@ def analyze_user_games(username, num_games=50, save_to_database=False):
     except Exception as e:
         print(f"⚠️  Could not fetch profile: {e}")
     
-    # Fetch recent games
-    print(f"\n🔄 Fetching recent games...")
-    games = get_recent_games(username, num_games)
+    # Fetch recent games with optional date filtering
+    print(f"\n🔄 Fetching games...")
+    games = get_recent_games(username, num_games, start_date, end_date)
     
     if not games:
         print("❌ No games found!")
@@ -564,7 +786,14 @@ def analyze_user_games(username, num_games=50, save_to_database=False):
         if opening not in openings:
             openings[opening] = {'count': 0, 'wins': 0, 'losses': 0, 'draws': 0}
         openings[opening]['count'] += 1
-        openings[opening][game['result'] + 's'] += 1
+        
+        # Update the appropriate result counter
+        if game['result'] == 'win':
+            openings[opening]['wins'] += 1
+        elif game['result'] == 'loss':
+            openings[opening]['losses'] += 1
+        elif game['result'] == 'draw':
+            openings[opening]['draws'] += 1
     
     # Accuracy analysis
     white_accuracies = [game['accuracy_white'] for game in analyzed_games if game['accuracy_white'] is not None]
@@ -642,40 +871,136 @@ def analyze_user_games(username, num_games=50, save_to_database=False):
 
 def main():
     """Main function to run the advanced analysis."""
+    parser = argparse.ArgumentParser(description='Chess.com Advanced Game Analysis with Database Integration')
+    parser.add_argument('usernames', nargs='*', default=['goose_o7'], 
+                       help='Chess.com username(s) to analyze (default: goose_o7). Can specify multiple usernames separated by spaces.')
+    parser.add_argument('-n', '--num-games', type=int, default=30,
+                       help='Number of games to analyze per user (default: 30)')
+    parser.add_argument('--use-database', action='store_true',
+                       help='Enable database storage (requires database_config.json)')
+    parser.add_argument('--delay', type=float, default=2.0,
+                       help='Delay in seconds between processing users (default: 2.0, helps with API rate limits)')
+    parser.add_argument('--start-date', type=str,
+                       help='Start date for game filtering (YYYY-MM-DD format, e.g., 2024-01-01)')
+    parser.add_argument('--end-date', type=str,
+                       help='End date for game filtering (YYYY-MM-DD format, e.g., 2024-12-31)')
+    parser.add_argument('--start-time', type=str,
+                       help='Start time for game filtering (HH:MM format, e.g., 14:30). Used with start-date.')
+    parser.add_argument('--end-time', type=str,
+                       help='End time for game filtering (HH:MM format, e.g., 18:45). Used with end-date.')
+    
+    args = parser.parse_args()
+    
     print("🔥 Chess.com Advanced Game Analysis with Database Integration")
     print("="*60)
     
-    # Database configuration
-    save_to_db = False
-    if PYODBC_AVAILABLE:
-        use_db = input("\nDo you want to use database storage? (y/n): ").strip().lower()
-        if use_db == 'y':
-            print("\n📊 Database Configuration:")
-            server = input("Azure SQL Server (e.g., your-server.database.windows.net): ").strip()
-            database = input("Database name: ").strip()
-            db_username = input("Username: ").strip()
-            password = input("Password: ").strip()
-            
-            if all([server, database, db_username, password]):
-                configure_database(server, database, db_username, password)
-                save_to_db = True
-            else:
-                print("⚠️  Incomplete database configuration, proceeding without database")
-                save_to_db = False
-    else:
-        save_to_db = False
-    
-    # Get username to analyze
-    chess_username = input("\nChess.com username to analyze: ").strip() or "hikaru"
-    num_games = input("Number of games to analyze (default 30): ").strip()
+    # Parse date and time arguments
+    start_datetime = None
+    end_datetime = None
     
     try:
-        num_games = int(num_games) if num_games else 30
-    except:
-        num_games = 30
+        if args.start_date:
+            start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
+            if args.start_time:
+                start_time = datetime.strptime(args.start_time, '%H:%M').time()
+                start_datetime = datetime.combine(start_date.date(), start_time)
+            else:
+                start_datetime = start_date
+                
+        if args.end_date:
+            end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
+            if args.end_time:
+                end_time = datetime.strptime(args.end_time, '%H:%M').time()
+                end_datetime = datetime.combine(end_date.date(), end_time)
+            else:
+                # Set to end of day if no time specified
+                end_datetime = datetime.combine(end_date.date(), datetime.max.time())
+                
+    except ValueError as e:
+        print(f"❌ Error parsing date/time: {e}")
+        print("   Date format: YYYY-MM-DD (e.g., 2024-01-01)")
+        print("   Time format: HH:MM (e.g., 14:30)")
+        return
     
-    print(f"\n🚀 Starting analysis...")
-    analyze_user_games(chess_username, num_games=num_games, save_to_database=save_to_db)
+    # Validate date range
+    if start_datetime and end_datetime and start_datetime > end_datetime:
+        print("❌ Start date/time cannot be after end date/time")
+        return
+    
+    # Database configuration
+    save_to_db = False
+    
+    if args.use_database:
+        if not PYODBC_AVAILABLE:
+            print("❌ pyodbc not available. Install with: pip install pyodbc")
+            print("   Database features will be disabled.")
+        elif not AZURE_AUTH_AVAILABLE:
+            print("❌ azure-identity not available. Install with: pip install azure-identity")
+            print("   Database features will be disabled.")
+        else:
+            print(f"\n📊 Loading database configuration from {DATABASE_CONFIG_FILE}...")
+            
+            # Load and validate config
+            config = load_database_config()
+            required_fields = ['server', 'database', 'tenant_id', 'client_id', 'client_secret']
+            missing_fields = [field for field in required_fields if not config.get(field) or config[field].startswith('your-')]
+            
+            if missing_fields:
+                print(f"❌ Please edit {DATABASE_CONFIG_FILE} and provide values for: {', '.join(missing_fields)}")
+                print("   Database features will be disabled.")
+            else:
+                print("✅ Database configuration loaded successfully")
+                save_to_db = True
+    
+    # Get usernames to analyze
+    usernames = args.usernames
+    num_games = args.num_games
+    delay = args.delay
+    
+    if len(usernames) == 1:
+        print(f"\n🚀 Starting analysis for {usernames[0]} ({num_games} games)...")
+    else:
+        print(f"\n🚀 Starting batch analysis for {len(usernames)} users ({num_games} games each)...")
+        print(f"👥 Users: {', '.join(usernames)}")
+        print(f"⏱️  Delay between users: {delay} seconds")
+    
+    # Display date filtering info
+    if start_datetime or end_datetime:
+        print(f"\n� Date Filtering:")
+        if start_datetime:
+            print(f"   From: {start_datetime.strftime('%Y-%m-%d %H:%M')}")
+        if end_datetime:
+            print(f"   To:   {end_datetime.strftime('%Y-%m-%d %H:%M')}")
+    
+    print(f"�📊 Database storage: {'Enabled' if save_to_db else 'Disabled'}")
+    
+    # Process each username
+    for i, username in enumerate(usernames, 1):
+        if len(usernames) > 1:
+            print(f"\n{'='*60}")
+            print(f"🎯 Processing user {i}/{len(usernames)}: {username}")
+            print(f"{'='*60}")
+        
+        try:
+            analyze_user_games(
+                username, 
+                num_games=num_games, 
+                save_to_database=save_to_db,
+                start_date=start_datetime,
+                end_date=end_datetime
+            )
+        except Exception as e:
+            print(f"❌ Error analyzing {username}: {e}")
+            print("   Continuing with next user...")
+        
+        # Add delay between users (except for the last one)
+        if i < len(usernames) and delay > 0:
+            print(f"\n⏳ Waiting {delay} seconds before processing next user...")
+            import time
+            time.sleep(delay)
+    
+    if len(usernames) > 1:
+        print(f"\n🏁 Batch analysis complete! Processed {len(usernames)} users.")
 
 
 if __name__ == "__main__":
