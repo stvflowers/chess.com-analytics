@@ -1,3 +1,4 @@
 chess.com
 requests
 python-dateutil
+pyodbc
