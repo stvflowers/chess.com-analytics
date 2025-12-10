@@ -11,7 +11,7 @@ sys.path.insert(0, '/workspaces/chess.com-analytics')
 
 try:
     # Test import
-    import advanced_game_analysis as aga
+    import scripts.advanced_game_analysis as aga
     print("✅ Successfully imported advanced_game_analysis")
     
     # Test basic functionality
